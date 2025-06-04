@@ -1930,7 +1930,7 @@ class FrameworkProcessor(ScriptProcessor):
                 pip install -r requirements.txt
             fi
             if [[ -f 'uv.lock' ]]; then
-                make install-dev
+                make install
                 uv run {entry_point_command} {entry_point} "$@"
             else
                 {entry_point_command} {entry_point} "$@"
