@@ -1929,8 +1929,12 @@ class FrameworkProcessor(ScriptProcessor):
 
                 pip install -r requirements.txt
             fi
-
-            {entry_point_command} {entry_point} "$@"
+            if [[ -f 'uv.lock' ]]; then
+                make install-dev
+                uv run {entry_point_command} {entry_point} "$@"
+            else
+                {entry_point_command} {entry_point} "$@"
+            fi            
         """
         ).format(
             codeartifact_login_command=codeartifact_login_command,
