@@ -434,7 +434,6 @@ def tar_and_upload_dir(
     """
     if directory and (is_pipeline_variable(directory) or directory.lower().startswith("s3://")):
         return UploadedCode(s3_prefix=directory, script_name=script)
-
     script_name = script if directory else os.path.basename(script)
     dependencies = dependencies or []
     key = "%s/sourcedir.tar.gz" % s3_key_prefix
@@ -481,14 +480,37 @@ def tar_and_upload_dir(
     return UploadedCode(s3_prefix="s3://%s/%s" % (bucket, key), script_name=script_name)
 
 
+    
+
 def _list_files_to_compress(script, directory):
-    """Placeholder docstring."""
+
+    """
+    List files in a directory excluding those matching entries in a .sagemakerignore file, if present.
+    """
     if directory is None:
         return [script]
 
     basedir = directory if directory else os.path.dirname(script)
-    return [os.path.join(basedir, name) for name in os.listdir(basedir)]
+    all_files = [os.path.join(basedir, name) for name in os.listdir(basedir)]
 
+    # Initialize ignore set
+    ignore_list = set()
+    ignore_path = os.path.join(basedir, '.sagemakerignore')
+    print("Looking for .sagemakerignore file at:", ignore_path)
+    if os.path.isfile(ignore_path):
+        with open(ignore_path, 'r') as f:
+            for line in f:
+                entry = line.strip()
+                if entry and not entry.startswith("#"):
+                    ignore_list.add(entry)
+
+    # Filter out items whose basename matches any ignore entry
+    filtered_files = [
+        path for path in all_files
+        if os.path.basename(path) not in ignore_list
+    ]
+
+    return filtered_files
 
 def framework_name_from_image(image_uri):
     # noinspection LongLine
