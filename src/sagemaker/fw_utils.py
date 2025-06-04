@@ -432,8 +432,11 @@ def tar_and_upload_dir(
         sagemaker.fw_utils.UploadedCode: An object with the S3 bucket and key (S3 prefix) and
             script name.
     """
+    logger.info("in tar and upload dir")
     if directory and (is_pipeline_variable(directory) or directory.lower().startswith("s3://")):
         return UploadedCode(s3_prefix=directory, script_name=script)
+    logger.info("next tar and upload dir")
+
     script_name = script if directory else os.path.basename(script)
     dependencies = dependencies or []
     key = "%s/sourcedir.tar.gz" % s3_key_prefix
@@ -449,12 +452,15 @@ def tar_and_upload_dir(
             "Inputted directory for storing newly generated temporary directory does "
             f"not exist: '{settings.local_download_dir}'"
         )
+    logger.info("next tar1 and upload dir")
     local_download_dir = None if settings is None else settings.local_download_dir
     tmp = tempfile.mkdtemp(dir=local_download_dir)
     encrypt_artifact = True if settings is None else settings.encrypt_repacked_artifacts
 
     try:
         source_files = _list_files_to_compress(script, directory) + dependencies
+        logger.info(f"next tar1 and upload dir {source_files} in")
+
         tar_file = sagemaker.utils.create_tar_file(
             source_files, os.path.join(tmp, _TAR_SOURCE_FILENAME)
         )
