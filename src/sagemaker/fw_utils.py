@@ -509,7 +509,7 @@ def _list_files_to_compress(script, directory):
         path for path in all_files
         if os.path.basename(path) not in ignore_list
     ]
-
+    logger.info(f"Files to compress: {filtered_files}")
     return filtered_files
 
 def framework_name_from_image(image_uri):
