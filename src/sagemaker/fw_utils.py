@@ -22,6 +22,8 @@ import tempfile
 import time
 from collections import namedtuple
 from typing import Dict, List, Optional, Union
+import os
+import pathspec
 
 from packaging import version
 
@@ -480,10 +482,8 @@ def tar_and_upload_dir(
     return UploadedCode(s3_prefix="s3://%s/%s" % (bucket, key), script_name=script_name)
 
 
-    
 
 def _list_files_to_compress(script, directory):
-
     """
     List files in a directory excluding those matching entries in a .sagemakerignore file, if present.
     """
@@ -491,26 +491,27 @@ def _list_files_to_compress(script, directory):
         return [script]
 
     basedir = directory if directory else os.path.dirname(script)
-    all_files = [os.path.join(basedir, name) for name in os.listdir(basedir)]
-
-    # Initialize ignore set
-    ignore_list = set()
+    
+    # Load .sagemakerignore patterns
     ignore_path = os.path.join(basedir, '.sagemakerignore')
-    print("Looking for .sagemakerignore file at:", ignore_path)
     if os.path.isfile(ignore_path):
         with open(ignore_path, 'r') as f:
-            for line in f:
-                entry = line.strip()
-                if entry and not entry.startswith("#"):
-                    ignore_list.add(entry)
+            ignore_patterns = f.read().splitlines()
+        spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
+    else:
+        spec = pathspec.PathSpec.from_lines('gitwildmatch', [])
 
-    # Filter out items whose basename matches any ignore entry
-    filtered_files = [
-        path for path in all_files
-        if os.path.basename(path) not in ignore_list
-    ]
-    logger.info(f"Files to compress: {filtered_files}")
-    return filtered_files
+    # Recursively collect all files
+    all_files = []
+    for root, dirs, files in os.walk(basedir):
+        for name in files:
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, basedir)
+            if not spec.match_file(rel_path):
+                all_files.append(full_path)
+
+    logger.info(f"Files to compress: {all_files}")
+    return all_files
 
 def framework_name_from_image(image_uri):
     # noinspection LongLine
