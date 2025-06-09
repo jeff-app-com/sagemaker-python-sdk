@@ -449,25 +449,33 @@ def _download_files_under_prefix(bucket_name, prefix, target, s3):
         obj.download_file(file_path)
 
 
-def create_tar_file(source_files, target=None):
-    """Create a tar file containing all the source_files
+
+def create_tar_file(source_files, target=None, base_dir=None):
+    """
+    Create a tar.gz file containing all the source_files with folder structure preserved.
 
     Args:
-        source_files: (List[str]): List of file paths that will be contained in the tar file
-        target:
+        source_files (List[str]): List of file paths to include in the tar.
+        target (str, optional): Output tar file path. If None, creates a temp file.
+        base_dir (str, optional): The base directory to preserve structure relative to.
 
     Returns:
-        (str): path to created tar file
+        str: Path to the created tar file.
     """
     if target:
         filename = target
     else:
-        _, filename = tempfile.mkstemp()
+        _, filename = tempfile.mkstemp(suffix=".tar.gz")
+
+    if base_dir is None:
+        # auto-detect common base directory
+        base_dir = os.path.commonpath(source_files)
 
     with tarfile.open(filename, mode="w:gz", dereference=True) as t:
         for sf in source_files:
-            # Add all files from the directory into the root of the directory structure of the tar
-            t.add(sf, arcname=os.path.basename(sf))
+            arcname = os.path.relpath(sf, base_dir)
+            t.add(sf, arcname=arcname)
+
     return filename
 
 
