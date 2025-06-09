@@ -487,6 +487,8 @@ def _list_files_to_compress(script, directory):
     """
     List files in a directory excluding those matching entries in a .sagemakerignore file, if present.
     """
+    logger.info("Listing files to compress for script: %s", script)
+    logger.info("Using directory: %s", directory)
     if directory is None:
         return [script]
 
