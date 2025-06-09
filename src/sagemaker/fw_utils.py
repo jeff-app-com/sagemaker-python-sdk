@@ -511,7 +511,8 @@ def _list_files_to_compress(script, directory):
             rel_path = os.path.relpath(full_path, basedir)
             if not spec.match_file(rel_path):
                 all_files.append(full_path)
-
+    if script:
+        all_files.append(script)
     logger.info(f"Files to compress: {all_files}")
     return all_files
 
