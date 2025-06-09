@@ -288,7 +288,7 @@ def hash_file(path: str) -> str:
     """
     return _hash_file(path, hashlib.sha256()).hexdigest()
 
-
+from sagemaker.fw_utils import _list_files_to_compress
 def hash_files_or_dirs(paths: List[str]) -> str:
     """Get the SHA256 hash of the contents of a list of files or directories.
 
@@ -303,6 +303,7 @@ def hash_files_or_dirs(paths: List[str]) -> str:
     Returns:
         str: The SHA256 hash of the list of files or directories.
     """
+    paths = _list_files_to_compress(paths[0], paths[1])
     sha256 = hashlib.sha256()
     for path in sorted(paths):
         sha256 = _hash_file_or_dir(path, sha256)
