@@ -65,6 +65,7 @@ class LocalTorchServe:
         response = None
         try:
             response = predictor.predict(self.schema_builder.sample_input)
+            logger.info("Deep ping successful, response: %s", response)
             return (True, response)
             # pylint: disable=broad-except
         except Exception as e:
