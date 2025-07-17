@@ -28,7 +28,7 @@ class LocalTorchServe:
         self.container = client.containers.run(
             image,
             "serve",
-            detach=True,
+            detach=False,
             auto_remove=True,
             network_mode="sagemaker",
             volumes={
