@@ -175,7 +175,7 @@ class LocalContainerMode(
             self._invoke_serving = tei_serving._invoke_tei_serving
 
         # allow some time for container to be ready
-        time.sleep(10)
+        time.sleep(25)
 
         log_generator = self.container.logs(follow=True, stream=True)
         time_limit = datetime.now() + timedelta(seconds=container_timeout_seconds)
@@ -194,7 +194,7 @@ class LocalContainerMode(
                 break
 
             # allow some time for container to be ready
-            time.sleep(10)
+            time.sleep(25)
 
             healthy, response = self._ping_container(predictor)
             if healthy:
