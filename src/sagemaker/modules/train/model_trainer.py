@@ -66,6 +66,7 @@ from sagemaker.modules.configs import (
     RemoteDebugConfig,
     SessionChainingConfig,
     InputData,
+    MetricDefinition,
 )
 
 from sagemaker.modules.local_core.local_container import _LocalContainer
@@ -84,6 +85,9 @@ from sagemaker.modules.constants import (
     SM_CODE_CONTAINER_PATH,
     SM_DRIVERS,
     SM_DRIVERS_LOCAL_PATH,
+    SM_RECIPE,
+    SM_RECIPE_YAML,
+    SM_RECIPE_CONTAINER_PATH,
     TRAIN_SCRIPT,
     DEFAULT_CONTAINER_ENTRYPOINT,
     DEFAULT_CONTAINER_ARGUMENTS,
@@ -99,7 +103,12 @@ from sagemaker.modules.templates import (
 from sagemaker.telemetry.telemetry_logging import _telemetry_emitter
 from sagemaker.telemetry.constants import Feature
 from sagemaker.modules import logger
-from sagemaker.modules.train.sm_recipes.utils import _get_args_from_recipe, _determine_device_type
+from sagemaker.modules.train.sm_recipes.utils import (
+    _get_args_from_recipe,
+    _determine_device_type,
+    _is_nova_recipe,
+    _load_base_recipe,
+)
 
 
 class Mode(Enum):
@@ -119,7 +128,8 @@ class ModelTrainer(BaseModel):
         from sagemaker.modules.train import ModelTrainer
         from sagemaker.modules.configs import SourceCode, Compute, InputData
 
-        source_code = SourceCode(source_dir="source", entry_script="train.py")
+        ignore_patterns = ['.env', '.git', '__pycache__', '.DS_Store', 'data']
+        source_code = SourceCode(source_dir="source", entry_script="train.py", ignore_patterns=ignore_patterns)
         training_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/my-training-image"
         model_trainer = ModelTrainer(
             training_image=training_image,
@@ -238,7 +248,9 @@ class ModelTrainer(BaseModel):
     _infra_check_config: Optional[InfraCheckConfig] = PrivateAttr(default=None)
     _session_chaining_config: Optional[SessionChainingConfig] = PrivateAttr(default=None)
     _remote_debug_config: Optional[RemoteDebugConfig] = PrivateAttr(default=None)
+    _metric_definitions: Optional[List[MetricDefinition]] = PrivateAttr(default=None)
 
+    _is_nova_recipe: Optional[bool] = PrivateAttr(default=None)
     _temp_recipe_train_dir: Optional[TemporaryDirectory] = PrivateAttr(default=None)
 
     CONFIGURABLE_ATTRIBUTES: ClassVar[List[str]] = [
@@ -446,6 +458,33 @@ class ModelTrainer(BaseModel):
                                 + "Must be a valid file within the 'source_dir'.",
                             )
 
+    @staticmethod
+    def _validate_and_load_hyperparameters_file(hyperparameters_file: str) -> Dict[str, Any]:
+        """Validate the hyperparameters file."""
+        if not os.path.exists(hyperparameters_file):
+            raise ValueError(f"Hyperparameters file not found: {hyperparameters_file}")
+        logger.info(f"Loading hyperparameters from file: {hyperparameters_file}")
+        with open(hyperparameters_file, "r") as f:
+            contents = f.read()
+            try:
+                hyperparameters = json.loads(contents)
+                logger.debug("Hyperparameters loaded as JSON")
+                return hyperparameters
+            except json.JSONDecodeError:
+                try:
+                    logger.info(f"contents: {contents}")
+                    hyperparameters = yaml.safe_load(contents)
+                    if not isinstance(hyperparameters, dict):
+                        raise ValueError("YAML contents must be a valid mapping")
+                    logger.info(f"hyperparameters: {hyperparameters}")
+                    logger.debug("Hyperparameters loaded as YAML")
+                    return hyperparameters
+                except (yaml.YAMLError, ValueError):
+                    raise ValueError(
+                        f"Invalid hyperparameters file: {hyperparameters_file}. "
+                        "Must be a valid JSON or YAML file."
+                    )
+
     def model_post_init(self, __context: Any):
         """Post init method to perform custom validation and set default values."""
         self._validate_training_image_and_algorithm_name(self.training_image, self.algorithm_name)
@@ -507,27 +546,9 @@ class ModelTrainer(BaseModel):
             )
 
         if self.hyperparameters and isinstance(self.hyperparameters, str):
-            if not os.path.exists(self.hyperparameters):
-                raise ValueError(f"Hyperparameters file not found: {self.hyperparameters}")
-            logger.info(f"Loading hyperparameters from file: {self.hyperparameters}")
-            with open(self.hyperparameters, "r") as f:
-                contents = f.read()
-                try:
-                    self.hyperparameters = json.loads(contents)
-                    logger.debug("Hyperparameters loaded as JSON")
-                except json.JSONDecodeError:
-                    try:
-                        logger.info(f"contents: {contents}")
-                        self.hyperparameters = yaml.safe_load(contents)
-                        if not isinstance(self.hyperparameters, dict):
-                            raise ValueError("YAML contents must be a valid mapping")
-                        logger.info(f"hyperparameters: {self.hyperparameters}")
-                        logger.debug("Hyperparameters loaded as YAML")
-                    except (yaml.YAMLError, ValueError):
-                        raise ValueError(
-                            f"Invalid hyperparameters file: {self.hyperparameters}. "
-                            "Must be a valid JSON or YAML file."
-                        )
+            self.hyperparameters = self._validate_and_load_hyperparameters_file(
+                self.hyperparameters
+            )
 
         if self.training_mode == Mode.SAGEMAKER_TRAINING_JOB:
             if self.output_data_config is None:
@@ -580,7 +601,7 @@ class ModelTrainer(BaseModel):
         """Train a model using AWS SageMaker.
 
         Args:
-            input_data_config (Optional[Union[List[Channel], Dict[str, DataSourceType]]]):
+            input_data_config (Optional[List[Union[Channel, InputData]]]):
                 The input data config for the training job.
                 Takes a list of Channel objects or a dictionary of channel names to DataSourceType.
                 DataSourceType can be an S3 URI string, local file path string,
@@ -596,11 +617,39 @@ class ModelTrainer(BaseModel):
         current_training_job_name = _get_unique_name(self.base_job_name)
         input_data_key_prefix = f"{self.base_job_name}/{current_training_job_name}/input"
 
-        self.input_data_config = input_data_config or self.input_data_config or []
+        final_input_data_config = self.input_data_config.copy() if self.input_data_config else []
 
-        if self.input_data_config:
-            self.input_data_config = self._get_input_data_config(
-                self.input_data_config, input_data_key_prefix
+        if input_data_config:
+            # merge the inputs with method parameter taking precedence
+            existing_channels = {input.channel_name: input for input in final_input_data_config}
+            new_channels = []
+            for new_input in input_data_config:
+                if new_input.channel_name in existing_channels:
+                    existing_channels[new_input.channel_name] = new_input
+                else:
+                    new_channels.append(new_input)
+
+            final_input_data_config = list(existing_channels.values()) + new_channels
+
+        if self._is_nova_recipe:
+            for input_data in final_input_data_config:
+                if input_data.channel_name == SM_RECIPE:
+                    raise ValueError(
+                        "Cannot use reserved channel name 'recipe' as an input channel name "
+                        " for Nova Recipe"
+                    )
+            recipe_file_path = os.path.join(self._temp_recipe_train_dir.name, SM_RECIPE_YAML)
+            recipe_channel = self.create_input_data_channel(
+                channel_name=SM_RECIPE,
+                data_source=recipe_file_path,
+                key_prefix=input_data_key_prefix,
+            )
+            final_input_data_config.append(recipe_channel)
+            self.hyperparameters.update({"sagemaker_recipe_local_path": SM_RECIPE_CONTAINER_PATH})
+
+        if final_input_data_config:
+            final_input_data_config = self._get_input_data_config(
+                final_input_data_config, input_data_key_prefix
             )
 
         if self.checkpoint_config and not self.checkpoint_config.s3_uri:
@@ -642,8 +691,9 @@ class ModelTrainer(BaseModel):
                     channel_name=SM_CODE,
                     data_source=self.source_code.source_dir,
                     key_prefix=input_data_key_prefix,
+                    ignore_patterns=self.source_code.ignore_patterns,
                 )
-                self.input_data_config.append(source_code_channel)
+                final_input_data_config.append(source_code_channel)
 
             self._prepare_train_script(
                 tmp_dir=tmp_dir,
@@ -663,8 +713,9 @@ class ModelTrainer(BaseModel):
                 channel_name=SM_DRIVERS,
                 data_source=tmp_dir.name,
                 key_prefix=input_data_key_prefix,
+                ignore_patterns=self.source_code.ignore_patterns,
             )
-            self.input_data_config.append(sm_drivers_channel)
+            final_input_data_config.append(sm_drivers_channel)
 
             # If source_code is provided, we will always use
             # the default container entrypoint and arguments
@@ -681,6 +732,7 @@ class ModelTrainer(BaseModel):
             training_image_config=self.training_image_config,
             container_entrypoint=container_entrypoint,
             container_arguments=container_arguments,
+            metric_definitions=self._metric_definitions,
         )
 
         resource_config = self.compute._to_resource_config()
@@ -691,7 +743,7 @@ class ModelTrainer(BaseModel):
                 training_job_name=current_training_job_name,
                 algorithm_specification=algorithm_specification,
                 hyper_parameters=string_hyper_parameters,
-                input_data_config=self.input_data_config,
+                input_data_config=final_input_data_config,
                 resource_config=resource_config,
                 vpc_config=vpc_config,
                 # Public Instance Attributes
@@ -736,14 +788,18 @@ class ModelTrainer(BaseModel):
                 sagemaker_session=self.sagemaker_session,
                 container_entrypoint=algorithm_specification.container_entrypoint,
                 container_arguments=algorithm_specification.container_arguments,
-                input_data_config=self.input_data_config,
+                input_data_config=final_input_data_config,
                 hyper_parameters=string_hyper_parameters,
                 environment=self.environment,
             )
             local_container.train(wait)
 
     def create_input_data_channel(
-        self, channel_name: str, data_source: DataSourceType, key_prefix: Optional[str] = None
+        self,
+        channel_name: str,
+        data_source: DataSourceType,
+        key_prefix: Optional[str] = None,
+        ignore_patterns: Optional[List[str]] = None,
     ) -> Channel:
         """Create an input data channel for the training job.
 
@@ -759,6 +815,10 @@ class ModelTrainer(BaseModel):
 
                 If specified, local data will be uploaded to:
                 ``s3://<default_bucket_path>/<key_prefix>/<channel_name>/``
+            ignore_patterns: (Optional[List[str]]) :
+                The ignore patterns to ignore specific files/folders when uploading to S3.
+                If not specified, default to: ['.env', '.git', '__pycache__', '.DS_Store',
+                '.cache', '.ipynb_checkpoints'].
         """
         channel = None
         if isinstance(data_source, str):
@@ -798,11 +858,28 @@ class ModelTrainer(BaseModel):
                     )
                     if self.sagemaker_session.default_bucket_prefix:
                         key_prefix = f"{self.sagemaker_session.default_bucket_prefix}/{key_prefix}"
-                    s3_uri = self.sagemaker_session.upload_data(
-                        path=data_source,
-                        bucket=self.sagemaker_session.default_bucket(),
-                        key_prefix=key_prefix,
-                    )
+                    if ignore_patterns and _is_valid_path(data_source, path_type="Directory"):
+                        tmp_dir = TemporaryDirectory()
+                        copied_path = os.path.join(
+                            tmp_dir.name, os.path.basename(os.path.normpath(data_source))
+                        )
+                        shutil.copytree(
+                            data_source,
+                            copied_path,
+                            dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(*ignore_patterns),
+                        )
+                        s3_uri = self.sagemaker_session.upload_data(
+                            path=copied_path,
+                            bucket=self.sagemaker_session.default_bucket(),
+                            key_prefix=key_prefix,
+                        )
+                    else:
+                        s3_uri = self.sagemaker_session.upload_data(
+                            path=data_source,
+                            bucket=self.sagemaker_session.default_bucket(),
+                            key_prefix=key_prefix,
+                        )
                     channel = Channel(
                         channel_name=channel_name,
                         data_source=DataSource(
@@ -849,7 +926,9 @@ class ModelTrainer(BaseModel):
                 channels.append(input_data)
             elif isinstance(input_data, InputData):
                 channel = self.create_input_data_channel(
-                    input_data.channel_name, input_data.data_source, key_prefix=key_prefix
+                    input_data.channel_name,
+                    input_data.data_source,
+                    key_prefix=key_prefix,
                 )
                 channels.append(channel)
             else:
@@ -960,6 +1039,7 @@ class ModelTrainer(BaseModel):
         checkpoint_config: Optional[shapes.CheckpointConfig] = None,
         training_input_mode: Optional[str] = "File",
         environment: Optional[Dict[str, str]] = None,
+        hyperparameters: Optional[Union[Dict[str, Any], str]] = {},
         tags: Optional[List[Tag]] = None,
         sagemaker_session: Optional[Session] = None,
         role: Optional[str] = None,
@@ -1056,14 +1136,21 @@ class ModelTrainer(BaseModel):
         """
         if compute.instance_type is None:
             raise ValueError(
-                "Must set ``instance_type`` in compute_config when using training recipes."
+                "Must set ``instance_type`` in ``compute`` input when using training recipes."
             )
         device_type = _determine_device_type(compute.instance_type)
-        if device_type == "cpu":
+        recipe = _load_base_recipe(
+            training_recipe=training_recipe, recipe_overrides=recipe_overrides
+        )
+        is_nova = _is_nova_recipe(recipe=recipe)
+
+        if device_type == "cpu" and not is_nova:
             raise ValueError(
-                "Training recipes are not supported for CPU instances. "
+                "Training recipe is not supported for CPU instances. "
                 + "Please provide a GPU or Tranium instance type."
             )
+        if training_image is None and is_nova:
+            raise ValueError("training_image must be provided when using recipe for Nova.")
 
         if training_image_config and training_image is None:
             raise ValueError("training_image must be provided when using training_image_config.")
@@ -1081,15 +1168,27 @@ class ModelTrainer(BaseModel):
         # - distributed
         # - compute
         # - hyperparameters
-        model_trainer_args, recipe_train_dir = _get_args_from_recipe(
-            training_recipe=training_recipe,
+        model_trainer_args, tmp_dir = _get_args_from_recipe(
+            training_recipe=recipe,
             recipe_overrides=recipe_overrides,
             requirements=requirements,
             compute=compute,
             region_name=sagemaker_session.boto_region_name,
+            role=role,
         )
         if training_image is not None:
             model_trainer_args["training_image"] = training_image
+        if hyperparameters and not is_nova:
+            logger.warning(
+                "Hyperparameters are not supported for general training recipes. "
+                + "Ignoring hyperparameters input."
+            )
+        if is_nova:
+            if hyperparameters and isinstance(hyperparameters, str):
+                hyperparameters = cls._validate_and_load_hyperparameters_file(hyperparameters)
+                model_trainer_args["hyperparameters"].update(hyperparameters)
+            elif hyperparameters and isinstance(hyperparameters, dict):
+                model_trainer_args["hyperparameters"].update(hyperparameters)
 
         model_trainer = cls(
             sagemaker_session=sagemaker_session,
@@ -1106,8 +1205,8 @@ class ModelTrainer(BaseModel):
             tags=tags,
             **model_trainer_args,
         )
-
-        model_trainer._temp_recipe_train_dir = recipe_train_dir
+        model_trainer._is_nova_recipe = is_nova
+        model_trainer._temp_recipe_train_dir = tmp_dir
         return model_trainer
 
     def with_tensorboard_output_config(
@@ -1247,4 +1346,34 @@ class ModelTrainer(BaseModel):
                 The checkpoint configuration for the training job.
         """
         self.checkpoint_config = checkpoint_config or configs.CheckpointConfig()
+        return self
+
+    def with_metric_definitions(
+        self, metric_definitions: List[MetricDefinition]
+    ) -> "ModelTrainer":  # noqa: D412
+        """Set the metric definitions for the training job.
+
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+            from sagemaker.modules.configs import MetricDefinition
+
+            metric_definitions = [
+                MetricDefinition(
+                    name="loss",
+                    regex="Loss: (.*?)",
+                )
+            ]
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_metric_definitions(metric_definitions)
+
+        Args:
+            metric_definitions (List[MetricDefinition]):
+                The metric definitions for the training job.
+        """
+        self._metric_definitions = metric_definitions
         return self
